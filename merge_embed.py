@@ -3,141 +3,172 @@ import os
 import folder_paths
 from safetensors.torch import save_file, load_file
 import re
+from typing import Union, List, Tuple
 
-class TextAndEmbeddingMerger:
-    """The magic behind converting both text and embeddings into mergeable vectors"""
-    
+class EmbeddingMergerAdvanced:
+    """
+    The heart of our embedding operations - handles both text and embeddings
+    just like the original A1111 extension
+    """
     def __init__(self):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.embedding_path = folder_paths.get_folder_paths("embeddings")[0]
         
-    def tokenize_and_encode(self, text, model):
-        """Turn text into embeddings using the model's tokenizer"""
+    def encode_tokens_to_embeddings(self, text: str, model) -> torch.Tensor:
+        """Convert text directly to embeddings using the model's CLIP tokenizer"""
         tokens = model.tokenize([text])[0]
-        # Get the text encoder's token embeddings
         token_embedding = model.clip.wrapped.text_model.embeddings.token_embedding.wrapped
-        # Convert tokens to embeddings
         return token_embedding(tokens.to(self.device))
 
-    def load_embedding(self, name):
-        """Load embedding files from disk"""
-        if not name.endswith(('.safetensors', '.pt')):
-            # Try both formats
-            for ext in ['.safetensors', '.pt']:
-                path = os.path.join(self.embedding_path, name + ext)
-                if os.path.exists(path):
-                    break
-        else:
+    def parse_merge_expression(self, expression: str) -> List[Tuple[str, str, float]]:
+        """
+        Parse expressions like:
+        <'word1' + 'word2'*0.5>
+        {'style1' + 'style2'/2}
+        """
+        # Strip the outer brackets if present
+        expression = expression.strip()
+        if expression.startswith(('<', '{')):
+            expression = expression[1:-1]
+        if expression.startswith("'"):
+            expression = expression[1:]
+            
+        operations = []
+        # Match our various syntax patterns
+        pattern = r"""
+            (?:
+                '([^']+)'                  # Quoted text
+                (?:
+                    \s*([+\-*/])\s*        # Operators
+                    (?:
+                        (\d*\.?\d*)        # Numbers
+                        |
+                        '([^']+)'          # Or another quoted text
+                    )
+                )?
+                |
+                ([^+\-*/'\s][^+\-*/']*)   # Unquoted text
+            )
+        """
+        
+        matches = re.finditer(pattern, expression, re.VERBOSE)
+        last_op = '+'
+        
+        for match in matches:
+            quoted, op, number, next_text, unquoted = match.groups()
+            text = quoted if quoted else unquoted
+            if text:
+                operations.append((text.strip(), last_op, 1.0))
+            if op:
+                last_op = op
+            if number:
+                operations[-1] = (operations[-1][0], operations[-1][1], float(number))
+            if next_text:
+                operations.append((next_text.strip(), last_op, 1.0))
+                
+        return operations
+
+    def merge_embeddings(self, vectors: List[Tuple[torch.Tensor, str, float]]) -> torch.Tensor:
+        """Merge embeddings according to their operations"""
+        result = None
+        
+        for tensor, op, value in vectors:
+            if result is None:
+                result = tensor * value if op in ['*', '/'] else tensor
+                continue
+                
+            if op == '+':
+                result = result + (tensor * value)
+            elif op == '-':
+                result = result - (tensor * value)
+            elif op == '*':
+                result = result * value
+            elif op == '/':
+                result = result / value
+                
+        return result
+
+    def load_embedding(self, name: str) -> Union[torch.Tensor, None]:
+        """Load embedding files with support for both .pt and .safetensors"""
+        try:
             path = os.path.join(self.embedding_path, name)
+            if not os.path.exists(path):
+                for ext in ['.safetensors', '.pt']:
+                    test_path = path + ext
+                    if os.path.exists(test_path):
+                        path = test_path
+                        break
             
-        if not os.path.exists(path):
-            return None
-            
-        if path.endswith('.pt'):
-            data = torch.load(path, map_location=self.device)
-            if 'string_to_param' in data:
-                return list(data['string_to_param'].values())[0]
-            elif 'emb_params' in data:
-                return data['emb_params']
-        else:
-            data = load_file(path, device=self.device)
-            if 'emb_params' in data:
-                return data['emb_params']
-            if 'clip_l' in data or 'clip_g' in data:
-                return [data.get('clip_l'), data.get('clip_g')]
+            if path.endswith('.pt'):
+                data = torch.load(path, map_location=self.device)
+                if 'string_to_param' in data:
+                    return list(data['string_to_param'].values())[0]
+                elif 'emb_params' in data:
+                    return data['emb_params']
+            else:
+                data = load_file(path, device=self.device)
+                if 'emb_params' in data:
+                    return data['emb_params']
+                # Handle SDXL style
+                if 'clip_l' in data or 'clip_g' in data:
+                    return [data.get('clip_l'), data.get('clip_g')]
+        except Exception as e:
+            print(f"Failed to load embedding {name}: {e}")
         return None
 
-class AdvancedMergerNode:
-    """The swiss army knife of embedding merging - handles text and embeddings!"""
+class MergerNode:
+    """The ComfyUI node that brings it all together"""
     
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "expression": ("STRING", {
-                    "default": "1girl, flowers + detailed*0.5", 
+                    "default": "<'1girl, flowers' + 'detailed'*0.5>", 
                     "multiline": True
                 }),
                 "model": ("MODEL",),
-                "output_name": ("STRING", {"default": "merged_result"})
+                "save_as": ("STRING", {
+                    "default": "merged_result",
+                    "multiline": False
+                })
             }
         }
     
-    RETURN_TYPES = ("EMBEDDING", "STRING")
-    FUNCTION = "merge_all"
-    CATEGORY = "embeddings"
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "merge"
+    CATEGORY = "conditioning"
     
-    def parse_expression(self, expr):
-        """Parse A1111-style expressions with support for regular text"""
-        # Match either quoted strings or unquoted text blocks
-        pattern = r"""
-            (?:
-                '([^']+)'     # Quoted strings
-                |
-                ([^+\-*/'\s][^+\-*/']*)  # Unquoted text blocks
-            )
-            (?:([+\-*/])(\d*\.?\d*))?  # Operations and values
-        """
-        tokens = re.findall(pattern, expr, re.VERBOSE)
-        operations = []
+    def merge(self, expression: str, model, save_as: str = ""):
+        merger = EmbeddingMergerAdvanced()
+        operations = merger.parse_merge_expression(expression)
+        tensors = []
         
-        for quoted, unquoted, op, value in tokens:
-            # Use either the quoted or unquoted text
-            text = quoted if quoted else unquoted.strip()
-            if not op:
-                op = '+'
-            if not value:
-                value = '1'
-            operations.append((text, op, float(value)))
-            
-        return operations
-
-    def merge_all(self, expression, model, output_name):
-        merger = TextAndEmbeddingMerger()
-        operations = self.parse_expression(expression)
-        
-        result = None
-        debug_info = []
-        
+        # Process each part of the expression
         for text, op, value in operations:
-            # First try to load as embedding
-            emb = merger.load_embedding(text)
-            
-            # If not an embedding, convert text to embeddings
-            if emb is None:
-                emb = merger.tokenize_and_encode(text, model)
-                debug_info.append(f"Converted text: '{text}'")
-            else:
-                debug_info.append(f"Loaded embedding: '{text}'")
-            
-            # Apply operations
-            if result is None:
-                result = emb * value if op in ['*', '/'] else emb
-            else:
-                if op == '+':
-                    result = result + (emb * value)
-                elif op == '-':
-                    result = result - (emb * value)
-                elif op == '*':
-                    result = result * value
-                elif op == '/':
-                    result = result / value
-            
-            debug_info.append(f"Applied operation: {op}{value}")
+            # First try as embedding
+            embedding = merger.load_embedding(text)
+            if embedding is None:
+                # If not an embedding, convert text to embeddings
+                embedding = merger.encode_tokens_to_embeddings(text, model)
+            tensors.append((embedding, op, value))
         
-        # Save if needed
-        if output_name:
-            path = os.path.join(merger.embedding_path, f"{output_name}.safetensors")
-            save_file({'emb_params': result}, path)
-            debug_info.append(f"Saved to: {output_name}.safetensors")
+        # Merge everything
+        result = merger.merge_embeddings(tensors)
         
-        return (result, "\n".join(debug_info))
+        # Save if requested
+        if save_as:
+            path = os.path.join(merger.embedding_path, f"{save_as}.safetensors")
+            save_file({'emb_params': result.cpu()}, path)
+        
+        # Return as conditioning for ComfyUI workflow
+        return ({"pooled": result, "embeds": result},)
 
-# For ComfyUI registration
+# Register with ComfyUI
 NODE_CLASS_MAPPINGS = {
-    "AdvancedEmbeddingMerger": AdvancedMergerNode
+    "EmbeddingMerger": MergerNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AdvancedEmbeddingMerger": "🎨 Advanced Embedding Merger (Text & Files)"
+    "EmbeddingMerger": "🎨 Embedding Merger (A1111 Style)"
 }
