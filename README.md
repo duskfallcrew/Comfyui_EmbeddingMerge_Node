@@ -1,4 +1,4 @@
-# Comfyui_EmbeddingMerge_Node
+# Embedding Merge for ComfyUI
 Extremely inspired and forked from: https://github.com/klimaleksus/stable-diffusion-webui-embedding-merge 
 
 # The Art of Embedding Merging
