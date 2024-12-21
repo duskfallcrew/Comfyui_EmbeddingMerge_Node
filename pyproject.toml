@@ -1,0 +1,14 @@
+[project]
+name = "comfyui_embeddingmerge_node"
+description = "Extremely inspired and forked from: [a/https://github.com/klimaleksus/stable-diffusion-webui-embedding-merge](https://github.com/klimaleksus/stable-diffusion-webui-embedding-merge)"
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/duskfallcrew/Comfyui_EmbeddingMerge_Node"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "Comfyui_EmbeddingMerge_Node"
+Icon = ""
