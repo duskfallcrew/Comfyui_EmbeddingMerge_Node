@@ -15,10 +15,10 @@ class EmbeddingMergerAdvanced:
         self.embedding_path = folder_paths.get_folder_paths("embeddings")[0]
         
     def encode_tokens_to_embeddings(self, text: str, model) -> torch.Tensor:
-        """Convert text directly to embeddings using the model's CLIP tokenizer"""
-        tokens = model.tokenize([text])[0]
-        token_embedding = model.clip.wrapped.text_model.embeddings.token_embedding.wrapped
-        return token_embedding(tokens.to(self.device))
+         """Convert text directly to embeddings using the model's CLIP tokenizer"""
+         tokens = model.tokenizer(text).input_ids
+         token_embedding = model.text_model.embeddings.token_embedding
+         return token_embedding(torch.tensor(tokens).to(self.device))
 
     def parse_merge_expression(self, expression: str) -> List[Tuple[str, str, float]]:
         """
@@ -26,57 +26,54 @@ class EmbeddingMergerAdvanced:
         <'word1' + 'word2'*0.5>
         {'style1' + 'style2'/2}
         """
-        # Strip the outer brackets if present
+        # Remove outer brackets
         expression = expression.strip()
         if expression.startswith(('<', '{')):
             expression = expression[1:-1]
-        if expression.startswith("'"):
-            expression = expression[1:]
-            
+        
         operations = []
-        # Match our various syntax patterns
-        pattern = r"""
-            (?:
-                '([^']+)'                  # Quoted text
-                (?:
-                    \s*([+\-*/])\s*        # Operators
-                    (?:
-                        (\d*\.?\d*)        # Numbers
-                        |
-                        '([^']+)'          # Or another quoted text
-                    )
-                )?
-                |
-                ([^+\-*/'\s][^+\-*/']*)   # Unquoted text
-            )
-        """
+        current_text = ""
+        current_op = '+'
+        current_weight = 1.0
         
-        matches = re.finditer(pattern, expression, re.VERBOSE)
-        last_op = '+'
+        # Split by operators while handling quotes correctly
+        parts = re.split(r"([+\-*/])", expression)
         
-        for match in matches:
-            quoted, op, number, next_text, unquoted = match.groups()
-            text = quoted if quoted else unquoted
-            if text:
-                operations.append((text.strip(), last_op, 1.0))
-            if op:
-                last_op = op
-            if number:
-                operations[-1] = (operations[-1][0], operations[-1][1], float(number))
-            if next_text:
-                operations.append((next_text.strip(), last_op, 1.0))
-                
+        for part in parts:
+            part = part.strip()
+            if part in ['+', '-', '*', '/']:
+                current_op = part
+            elif part:
+                # Check if it's a quoted word
+                match = re.match(r"'([^']+)'", part)
+                if match:
+                    text = match.group(1)
+                    operations.append((text, current_op, current_weight))
+                else:
+                    # Check if it's a number (for weight)
+                    try:
+                        weight = float(part)
+                        if operations:
+                            # Apply the weight to the last added operation
+                            operations[-1] = (operations[-1][0], operations[-1][1], weight)
+                        current_weight = 1.0 # Reset the current weight
+                    except ValueError:
+                        # If not a number assume it's a text input
+                        operations.append((part, current_op, current_weight))
+                        
+                        
         return operations
 
     def merge_embeddings(self, vectors: List[Tuple[torch.Tensor, str, float]]) -> torch.Tensor:
         """Merge embeddings according to their operations"""
         result = None
-        
+
         for tensor, op, value in vectors:
+            tensor = tensor.squeeze(0)
             if result is None:
                 result = tensor * value if op in ['*', '/'] else tensor
                 continue
-                
+
             if op == '+':
                 result = result + (tensor * value)
             elif op == '-':
@@ -85,8 +82,8 @@ class EmbeddingMergerAdvanced:
                 result = result * value
             elif op == '/':
                 result = result / value
-                
-        return result
+
+        return result.unsqueeze(0)  # return the tensor in a dimension of [1, embedding_dim]
 
     def load_embedding(self, name: str) -> Union[torch.Tensor, None]:
         """Load embedding files with support for both .pt and .safetensors"""
@@ -111,7 +108,7 @@ class EmbeddingMergerAdvanced:
                     return data['emb_params']
                 # Handle SDXL style
                 if 'clip_l' in data or 'clip_g' in data:
-                    return [data.get('clip_l'), data.get('clip_g')]
+                    return torch.cat([data.get('clip_l', torch.empty(0)), data.get('clip_g', torch.empty(0))], dim=0) #this might need to be modified to work properly
         except Exception as e:
             print(f"Failed to load embedding {name}: {e}")
         return None
@@ -124,13 +121,16 @@ class MergerNode:
         return {
             "required": {
                 "expression": ("STRING", {
-                    "default": "<'1girl, flowers' + 'detailed'*0.5>", 
+                    "default": "<'1girl, flowers' + 'detailed'*0.5>",
                     "multiline": True
                 }),
                 "model": ("MODEL",),
                 "save_as": ("STRING", {
-                    "default": "merged_result",
+                    "default": "",
                     "multiline": False
+                }),
+                "save_location": ("STRING", {
+                  "default": "embeddings"
                 })
             }
         }
@@ -139,7 +139,7 @@ class MergerNode:
     FUNCTION = "merge"
     CATEGORY = "conditioning"
     
-    def merge(self, expression: str, model, save_as: str = ""):
+    def merge(self, expression: str, model, save_as: str = "", save_location="embeddings"):
         merger = EmbeddingMergerAdvanced()
         operations = merger.parse_merge_expression(expression)
         tensors = []
@@ -150,7 +150,11 @@ class MergerNode:
             embedding = merger.load_embedding(text)
             if embedding is None:
                 # If not an embedding, convert text to embeddings
-                embedding = merger.encode_tokens_to_embeddings(text, model)
+                try:
+                  embedding = merger.encode_tokens_to_embeddings(text, model.clip)
+                except Exception as e:
+                  print(f"failed to convert text {text} to embeddings")
+                  return None # This will return a None object to ComfyUI
             tensors.append((embedding, op, value))
         
         # Merge everything
@@ -158,11 +162,17 @@ class MergerNode:
         
         # Save if requested
         if save_as:
-            path = os.path.join(merger.embedding_path, f"{save_as}.safetensors")
-            save_file({'emb_params': result.cpu()}, path)
-        
-        # Return as conditioning for ComfyUI workflow
-        return ({"pooled": result, "embeds": result},)
+            path = os.path.join(folder_paths.get_folder_paths(save_location)[0], f"{save_as}.safetensors")
+            try:
+              save_file({'emb_params': result.cpu()}, path)
+            except Exception as e:
+              print(f"Failed to save the file with error {e}")
+
+        if result is None:
+          return None
+        else:
+          return ({"pooled": result, "embeds": result},) # This will return a dictionary of "embeds"
+          # ComfyUI then detects that as a conditioning object
 
 # Register with ComfyUI
 NODE_CLASS_MAPPINGS = {
