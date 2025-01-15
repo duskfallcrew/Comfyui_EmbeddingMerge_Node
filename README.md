@@ -1,7 +1,8 @@
 # Embedding Merge for ComfyUI
 Extremely inspired and forked from: https://github.com/klimaleksus/stable-diffusion-webui-embedding-merge 
 
-This is NOT likely going to be continued to be developed as I don't use ComfyUI.
+SUPPOSEDLY PEOPLE WANT THIS - I am moving this to Ktiseos Nyx for further engagement and i'll work on that asap.
+It'll be a while, as I dont personally use ComfyUI, but want to be able to see people who MOVE to ComfyUI BE COMFY!
 
 # The Art of Embedding Merging
 *Turning Words into Visual Magic*
